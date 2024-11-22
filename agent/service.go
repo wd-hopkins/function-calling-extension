@@ -8,69 +8,68 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math/big"
-	"net/http"
-
 	"github.com/copilot-extensions/function-calling-extension/copilot"
 	"github.com/google/go-github/v57/github"
 	"github.com/invopop/jsonschema"
 	"github.com/wk8/go-ordered-map/v2"
+	"io"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	"math/big"
+	"net/http"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 var tools []copilot.FunctionTool
 
 func init() {
-	listProperties := orderedmap.New[string, *jsonschema.Schema]()
-	listProperties.Set("repository_owner", &jsonschema.Schema{
+	listPodProperties := orderedmap.New[string, *jsonschema.Schema]()
+	listPodProperties.Set("namespace", &jsonschema.Schema{
 		Type:        "string",
-		Description: "The owner of the repository",
+		Description: "The namespace to list pods from",
 	})
-	listProperties.Set("repository_name", &jsonschema.Schema{
+	deleteNamespaceProperties := orderedmap.New[string, *jsonschema.Schema]()
+	deleteNamespaceProperties.Set("namespace", &jsonschema.Schema{
 		Type:        "string",
-		Description: "The type of the repository",
-	})
-
-	createProperties := orderedmap.New[string, *jsonschema.Schema]()
-	createProperties.Set("repository_owner", &jsonschema.Schema{
-		Type:        "string",
-		Description: "The owner of the repository",
-	})
-	createProperties.Set("repository_name", &jsonschema.Schema{
-		Type:        "string",
-		Description: "The name of the repository",
-	})
-	createProperties.Set("issue_title", &jsonschema.Schema{
-		Type:        "string",
-		Description: "The title of the issue being created",
-	})
-	createProperties.Set("issue_body", &jsonschema.Schema{
-		Type:        "string",
-		Description: "The content of the issue being created",
+		Description: "The namespace to list pods from",
 	})
 
 	tools = []copilot.FunctionTool{
 		{
 			Type: "function",
 			Function: copilot.Function{
-				Name:        "list_issues",
-				Description: "Fetch a list of issues from github.com for a given repository.  Users may specify the repository owner and the repository name separately, or they may specify it in the form {repository_owner}/{repository_name}, or in the form github.com/{repository_owner}/{repository_name}.",
+				Name:        "get_namespaces",
+				Description: "Fetch all of the namespaces from a kubernetes cluster. When responding with a list, use a bullet pointed list. A user may ask for all namespaces, or a specific namespace. A user may ask for information about a namespace. Use the fields in the namespace object to determine what information to provide.",
 				Parameters: &jsonschema.Schema{
 					Type:       "object",
-					Properties: listProperties,
-					Required:   []string{"repository_owner", "repository_name"},
+					Properties: orderedmap.New[string, *jsonschema.Schema](),
+					Required:   []string{},
 				},
 			},
 		},
 		{
 			Type: "function",
 			Function: copilot.Function{
-				Name:        "create_issue_dialog",
-				Description: "Creates a confirmation dialog in which the user can interact with in order to create an issue on a github.com repository.  Only one dialog should be created for each issue/repository combination.  Users may specify the repository owner and the repository name separately, or they may specify it in the form {repository_owner}/{repository_name}, or in the form github.com/{repository_owner}/{repository_name}.",
+				Name:        "delete_namespace",
+				Description: "A user will provide a namespace to delete. The input is the namespace name. Prompt the user to confirm the deletion.",
 				Parameters: &jsonschema.Schema{
 					Type:       "object",
-					Properties: createProperties,
-					Required:   []string{"repository_owner", "repository_name", "issue_title", "issue_body"},
+					Properties: deleteNamespaceProperties,
+					Required:   []string{"namespace"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: copilot.Function{
+				Name:        "get_pods_in_namespace",
+				Description: "Fetch a list of pods from a kubernetes namespace. The input is the namespace name. When responding with a list, use a bullet pointed list. A user may ask for all pods, or a specific pod. A user may ask for information about a pod. Only give the name of the pod unless asked otherwise. Use the fields in the pod object to determine what information to provide.",
+				Parameters: &jsonschema.Schema{
+					Type:       "object",
+					Properties: listPodProperties,
+					Required:   []string{"namespace"},
 				},
 			},
 		},
@@ -133,7 +132,7 @@ func generateCompletion(ctx context.Context, integrationID, apiToken string, req
 			continue
 		}
 
-		err := createIssue(ctx, apiToken, conf.Confirmation.Owner, conf.Confirmation.Repo, conf.Confirmation.Title, conf.Confirmation.Body)
+		err := deleteNamespace(ctx, conf.Confirmation.Namespace)
 		if err != nil {
 			return err
 		}
@@ -144,7 +143,7 @@ func generateCompletion(ctx context.Context, integrationID, apiToken string, req
 					Index: 0,
 					Delta: sseResponseMessage{
 						Role:    "assistant",
-						Content: fmt.Sprintf("Created issue %s on repository %s/%s", conf.Confirmation.Title, conf.Confirmation.Owner, conf.Confirmation.Repo),
+						Content: fmt.Sprintf("Namespace \"%s\" deleted", conf.Confirmation.Namespace),
 					},
 				},
 			},
@@ -203,33 +202,35 @@ func generateCompletion(ctx context.Context, integrationID, apiToken string, req
 
 		switch function.Name {
 
-		case "list_issues":
+		case "get_namespaces":
+			msg, err := getNamespaces(ctx)
+			if err != nil {
+				return err
+			}
+			messages = append(messages, *msg)
+		case "get_pods_in_namespace":
 			args := &struct {
-				Owner string `json:"repository_owner"`
-				Name  string `json:"repository_name"`
+				Namespace string `json:"namespace"`
 			}{}
 			err := json.Unmarshal([]byte(function.Arguments), &args)
 			if err != nil {
 				return fmt.Errorf("error unmarshalling function arguments: %w", err)
 			}
-			msg, err := listIssues(ctx, apiToken, args.Owner, args.Name)
+			msg, err := getPodsInNamespace(ctx, args.Namespace)
 			if err != nil {
 				return err
 			}
 			messages = append(messages, *msg)
-		case "create_issue_dialog":
+		case "delete_namespace":
 			args := &struct {
-				Owner string `json:"repository_owner"`
-				Name  string `json:"repository_name"`
-				Title string `json:"issue_title"`
-				Body  string `json:"issue_body"`
+				Namespace string `json:"namespace"`
 			}{}
 			err := json.Unmarshal([]byte(function.Arguments), &args)
 			if err != nil {
 				return fmt.Errorf("error unmarshalling function arguments: %w", err)
 			}
 
-			conf, msg := createIssueConfirmation(args.Owner, args.Name, args.Title, args.Body)
+			conf, msg := deleteNamespaceConfirmation(args.Namespace)
 
 			found := false
 			for _, existing_conf := range confs {
@@ -259,38 +260,98 @@ func generateCompletion(ctx context.Context, integrationID, apiToken string, req
 	return nil
 }
 
-func listIssues(ctx context.Context, apiToken, owner, repo string) (*copilot.ChatMessage, error) {
-	client := github.NewClient(nil).WithAuthToken(apiToken)
-	issues, _, err := client.Issues.ListByRepo(ctx, owner, repo, nil)
+func getNamespaces(ctx context.Context) (*copilot.ChatMessage, error) {
+	k8sClient, err := getLocalClient()
 	if err != nil {
-		return nil, fmt.Errorf("error fetching issues: %w", err)
+		return nil, fmt.Errorf("error getting k8s client: %w", err)
 	}
 
-	serializedIssues, err := json.Marshal(issues)
+	namespaceList := &corev1.NamespaceList{}
+	err = k8sClient.List(ctx, namespaceList)
 	if err != nil {
-		return nil, fmt.Errorf("error serializing issues")
+		return nil, fmt.Errorf("error listing namespaces: %w", err)
+	}
+
+	serializedNamespaces, err := json.Marshal(namespaceList)
+	if err != nil {
+		return nil, fmt.Errorf("error serializing namespaces")
 	}
 
 	return &copilot.ChatMessage{
 		Role:    "system",
-		Content: fmt.Sprintf("The issues for the repository %s/%s are: %s", owner, repo, string(serializedIssues)),
+		Content: fmt.Sprintf("The namespaces in the cluster are: %s", string(serializedNamespaces)),
 	}, nil
 }
 
-func createIssueConfirmation(owner, repo, title, body string) (*copilot.ResponseConfirmation, *copilot.ChatMessage) {
+func deleteNamespace(ctx context.Context, ns string) error {
+	k8sClient, err := getLocalClient()
+	if err != nil {
+		return fmt.Errorf("error getting k8s client: %w", err)
+	}
+
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ns,
+		},
+	}
+	err = k8sClient.Delete(ctx, namespace)
+	if err != nil {
+		return fmt.Errorf("error deleting namespace: %w", err)
+	}
+
+	return nil
+}
+
+func getPodsInNamespace(ctx context.Context, namespace string) (*copilot.ChatMessage, error) {
+	k8sClient, err := getLocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("error getting k8s client: %w", err)
+	}
+
+	podList := &corev1.PodList{}
+	err = k8sClient.List(ctx, podList, client.InNamespace(namespace))
+	if err != nil {
+		return nil, fmt.Errorf("error listing namespaces: %w", err)
+	}
+
+	serializedPods, err := json.Marshal(podList)
+	if err != nil {
+		return nil, fmt.Errorf("error serializing pods")
+	}
+
+	return &copilot.ChatMessage{
+		Role:    "system",
+		Content: fmt.Sprintf("The pods in the namespace %s are: %s", namespace, string(serializedPods)),
+	}, nil
+}
+
+func getLocalClient() (client.Client, error) {
+	kc, err := config.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	newKubeClient, err := client.New(kc, client.Options{
+		Scheme: scheme.Scheme,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return newKubeClient, nil
+}
+
+func deleteNamespaceConfirmation(ns string) (*copilot.ResponseConfirmation, *copilot.ChatMessage) {
 	return &copilot.ResponseConfirmation{
 			Type:    "action",
-			Title:   "Create Issue",
-			Message: fmt.Sprintf("Are you sure you want to create an issue in repository %s/%s with the title \"%s\" and the content \"%s\"", owner, repo, title, body),
+			Title:   "Delete Namespace",
+			Message: fmt.Sprintf("Are you sure you want to delete the namespace \"%s\"", ns),
 			Confirmation: &copilot.ConfirmationData{
-				Owner: owner,
-				Repo:  repo,
-				Title: title,
-				Body:  body,
+				Namespace: ns,
 			},
 		}, &copilot.ChatMessage{
 			Role:    "system",
-			Content: fmt.Sprintf("Issue dialog created: {\"issue_title\": \"%s\", \"issue_body\": \"%s\", \"repository_owner\": \"%s\", \"repository_name\": \"%s\"}", title, body, owner, repo),
+			Content: fmt.Sprintf("Namespace \"%s\" deleted", ns),
 		}
 }
 

@@ -35,7 +35,7 @@ func ChatCompletions(ctx context.Context, integrationID, apiKey string, req *Cha
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		fmt.Println(string(b))
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d\n\nbody: \n%s", resp.StatusCode, b)
 	}
 
 	var chatRes *ChatCompletionsResponse

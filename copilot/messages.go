@@ -28,10 +28,7 @@ type ChatConfirmation struct {
 }
 
 type ConfirmationData struct {
-	Owner string `json:"owner"`
-	Repo  string `json:"repo"`
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	Namespace string `json:"namespace"`
 }
 
 type ResponseConfirmation struct {
